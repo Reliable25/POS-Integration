@@ -6,18 +6,18 @@ import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.os.Build
 import android.os.Bundle
+import android.util.Base64
 import android.util.Log
 import android.webkit.WebView
 import android.widget.Toast
 import androidx.annotation.RequiresApi
 import androidx.fragment.app.FragmentActivity
 import androidx.lifecycle.lifecycleScope
+import com.google.zxing.integration.android.IntentIntegrator
 import com.systemspecs.remita.processor.device.*
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
-import android.util.Base64
-import com.google.zxing.integration.android.IntentIntegrator
 import java.io.ByteArrayOutputStream
 
 class MainActivity : FragmentActivity(), RemitaCardTransactionListener {
@@ -28,6 +28,7 @@ class MainActivity : FragmentActivity(), RemitaCardTransactionListener {
 
     companion object {
         const val CAMERA_REQUEST = 1001
+        private const val TAG = "POS_APP"
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -36,15 +37,14 @@ class MainActivity : FragmentActivity(), RemitaCardTransactionListener {
 
         webView = findViewById(R.id.webView)
 
-        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.KITKAT) {
-            WebView.setWebContentsDebuggingEnabled(true)
-        }
+        WebView.setWebContentsDebuggingEnabled(Build.VERSION.SDK_INT >= Build.VERSION_CODES.KITKAT)
 
-        val settings = webView.settings
-        settings.javaScriptEnabled = true
-        settings.domStorageEnabled = true
-        settings.allowFileAccess = false
-        settings.allowContentAccess = false
+        webView.settings.apply {
+            javaScriptEnabled = true
+            domStorageEnabled = true
+            allowFileAccess = false
+            allowContentAccess = false
+        }
 
         webView.webViewClient = object : android.webkit.WebViewClient() {
             @RequiresApi(Build.VERSION_CODES.O)
@@ -52,9 +52,9 @@ class MainActivity : FragmentActivity(), RemitaCardTransactionListener {
                 view: WebView,
                 detail: android.webkit.RenderProcessGoneDetail
             ): Boolean {
-                Log.e("WebView", "Renderer crashed, didCrash=${detail.didCrash()}")
+                Log.e(TAG, "WebView crashed: ${detail.didCrash()}")
                 view.destroy()
-                return true // prevent app kill
+                return true
             }
         }
 
@@ -65,28 +65,59 @@ class MainActivity : FragmentActivity(), RemitaCardTransactionListener {
 
         remitaK11 = RemitaK11(
             this,
-            EnvType.Test,
-            apiKey = "sk_test_w1ej15bfw1ctcM/taMkU7ruXaRbo81iWp/78iaj4gchj9MQXhrCsbv3H0dMlxwfO"
+            EnvType.Live,
+            apiKey = "sk_live_FZ4EktzLcEK+Hk34jjMv8f5kbW89Aa93stjFMay+YI3xqxcbXwupdj63F8E73/MC"
         )
+
         remitaK11.setRemitaCardTransactionListener(this)
+
+        performKeyExchange()
     }
 
-    override fun onDestroy() {
-        if (::webView.isInitialized) {
-            webView.loadUrl("about:blank")
-            webView.clearHistory()
-            webView.removeAllViews()
-            webView.destroy()
+    // -----------------------------
+    // KEY EXCHANGE (FIXED)
+    // -----------------------------
+    private fun performKeyExchange() {
+        lifecycleScope.launch {
+            try {
+                Log.d(TAG, "Starting key exchange")
+
+                val result = remitaK11.keyExchange() // capture result if SDK returns one
+
+                Log.d(TAG, "Key exchange result: $result")
+
+                runOnUiThread {
+                    Toast.makeText(
+                        this@MainActivity,
+                        "Key exchange completed",
+                        Toast.LENGTH_SHORT
+                    ).show()
+                }
+
+            } catch (e: Exception) {
+                Log.e(TAG, "Key exchange failed", e)
+
+                runOnUiThread {
+                    Toast.makeText(
+                        this@MainActivity,
+                        "Key exchange failed: ${e.message}",
+                        Toast.LENGTH_LONG
+                    ).show()
+                }
+            }
         }
-        super.onDestroy()
     }
 
+    // -----------------------------
+    // PAYMENT START
+    // -----------------------------
     fun startK11Payment(amount: Int) {
         lifecycleScope.launch {
-            val transactionRef = "POS-${System.currentTimeMillis()}"
+            val ref = "POS-${System.currentTimeMillis()}"
+
             remitaK11.processCardTransaction(
                 amountInKobo = amount * 100L,
-                transRef = transactionRef,
+                transRef = ref,
                 currencyCode = "NGN",
                 transactionType = TransactionType.purchase,
                 transactionDescription = "POS Purchase"
@@ -94,36 +125,74 @@ class MainActivity : FragmentActivity(), RemitaCardTransactionListener {
         }
     }
 
-    fun mockK11Payment(amount: Int) {
-        webView.postDelayed({
-            val mockResponse = CardTransactionResponse(
-                transactionState = TransactionState.TRANSACTION_SUCCESSFUL,
-                message = "Mock transaction successful",
-                transactionData = null
-            )
-            onRemitaCardTransactionResponse(mockResponse)
-        }, 2000)
-    }
+    // -----------------------------
+    // RESPONSE HANDLING (FIXED - IMPORTANT)
+    // -----------------------------
 
     override fun onRemitaCardTransactionResponse(response: CardTransactionResponse) {
+
         runOnUiThread {
+
+            val data = response.transactionData
+            val processCode = data?.processCode
+            val message = data?.processMessage ?: data?.description ?: response.message
+
+            val isSuccessful =
+                response.transactionState == TransactionState.TRANSACTION_SUCCESSFUL &&
+                        (processCode == "00" || processCode == "0")
+
+            Log.d(TAG, """
+            STATE: ${response.transactionState}
+            CODE: $processCode
+            MESSAGE: $message
+        """.trimIndent())
+
             when (response.transactionState) {
-                TransactionState.INSERT_CARD ->
-                    Toast.makeText(this, "Please insert your card", Toast.LENGTH_SHORT).show()
 
-                TransactionState.TRANSACTION_SUCCESSFUL ->
-                    Toast.makeText(this, "Transaction successful", Toast.LENGTH_SHORT).show()
+                TransactionState.INSERT_CARD -> {
+                    showToast("Insert card")
+                }
 
-                TransactionState.FAILED ->
-                    Toast.makeText(this, "Transaction failed", Toast.LENGTH_SHORT).show()
+                TransactionState.PROCESSING -> {
+                    showToast("Processing...")
+                }
 
-                else ->
-                    Toast.makeText(this, "Transaction state: ${response.transactionState}", Toast.LENGTH_SHORT).show()
+                TransactionState.TRANSACTION_SUCCESSFUL -> {
+
+                    if (isSuccessful) {
+                        showToast("Transaction Successful")
+                    } else {
+                        showToast("Transaction Failed: $message")
+                    }
+                }
+
+                else -> {
+                    // Ignore intermediate SDK messages like:
+                    // "Input Pin", "Done", etc.
+                    Log.d(TAG, "Intermediate State: $message")
+                }
             }
-            print(response)
+
+            val jsState = if (isSuccessful) "SUCCESS" else "FAILED"
+
+            webView.evaluateJavascript(
+                """
+            if (window.onPosTransaction) {
+                window.onPosTransaction('$jsState');
+            }
+            """.trimIndent(),
+                null
+            )
         }
     }
 
+    private fun showToast(msg: String) {
+        Toast.makeText(this, msg, Toast.LENGTH_LONG).show()
+    }
+
+    // -----------------------------
+    // PRINT
+    // -----------------------------
     fun printFromWeb(base64Image: String) {
         lifecycleScope.launch(Dispatchers.IO) {
             try {
@@ -131,24 +200,28 @@ class MainActivity : FragmentActivity(), RemitaCardTransactionListener {
                     .replace("data:image/png;base64,", "")
                     .replace("\n", "")
 
-                val decodedBytes = Base64.decode(cleanBase64, Base64.DEFAULT)
-                val bitmap = BitmapFactory.decodeByteArray(decodedBytes, 0, decodedBytes.size)
+                val bytes = Base64.decode(cleanBase64, Base64.DEFAULT)
+                val bitmap = BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
 
                 withContext(Dispatchers.Main) {
                     remitaK11.print(img = bitmap) {
-                        Log.d("POS_PRINT", it)
+                        Log.d(TAG, it)
                     }
                 }
+
             } catch (e: Exception) {
-                Log.e("POS_PRINT", "Print failed", e)
+                Log.e(TAG, "Print failed", e)
             }
         }
     }
 
+    // -----------------------------
+    // SCAN + CAMERA RESULT
+    // -----------------------------
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
 
         val scanResult = IntentIntegrator.parseActivityResult(requestCode, resultCode, data)
-        if (scanResult != null && scanResult.contents != null) {
+        if (scanResult?.contents != null) {
             webView.evaluateJavascript(
                 "window.onCodeScanned('${scanResult.contents}')",
                 null
@@ -161,6 +234,7 @@ class MainActivity : FragmentActivity(), RemitaCardTransactionListener {
 
             val baos = ByteArrayOutputStream()
             bitmap.compress(Bitmap.CompressFormat.PNG, 100, baos)
+
             val base64 = Base64.encodeToString(baos.toByteArray(), Base64.NO_WRAP)
 
             webView.evaluateJavascript(
@@ -172,6 +246,4 @@ class MainActivity : FragmentActivity(), RemitaCardTransactionListener {
 
         super.onActivityResult(requestCode, resultCode, data)
     }
-
 }
-
