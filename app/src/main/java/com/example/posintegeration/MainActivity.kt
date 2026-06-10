@@ -1,5 +1,5 @@
 package com.example.posintegeration
-
+import com.google.gson.Gson
 import android.app.Activity
 import android.content.Intent
 import android.graphics.Bitmap
@@ -130,62 +130,137 @@ class MainActivity : FragmentActivity(), RemitaCardTransactionListener {
     // -----------------------------
 
     override fun onRemitaCardTransactionResponse(response: CardTransactionResponse) {
-
+        Log.d(TAG, "CALLBACK RECEIVED => ${response.transactionState}")
         runOnUiThread {
-
             val data = response.transactionData
             val processCode = data?.processCode
-            val message = data?.processMessage ?: data?.description ?: response.message
+            val processMessage = data?.processMessage ?: response.transactionState.name
 
-            val isSuccessful =
-                response.transactionState == TransactionState.TRANSACTION_SUCCESSFUL &&
-                        (processCode == "00" || processCode == "0")
+            val isSuccess = response.transactionState == TransactionState.TRANSACTION_SUCCESSFUL &&
+                    (processCode == "00" || processCode == "0")
 
-            Log.d(TAG, """
-            STATE: ${response.transactionState}
-            CODE: $processCode
-            MESSAGE: $message
-        """.trimIndent())
+            Log.d(TAG, "STATE: ${response.transactionState}, CODE: $processCode, MESSAGE: $processMessage")
 
             when (response.transactionState) {
-
                 TransactionState.INSERT_CARD -> {
-                    showToast("Insert card")
+                    Toast.makeText(this, "Please insert your card", Toast.LENGTH_SHORT).show()
                 }
 
                 TransactionState.PROCESSING -> {
-                    showToast("Processing...")
+                    Toast.makeText(this, "Processing transaction, please wait...", Toast.LENGTH_SHORT).show()
                 }
 
                 TransactionState.TRANSACTION_SUCCESSFUL -> {
+                    if (isSuccess) {
+                        // Success - show success toast
+                        Toast.makeText(
+                            this,
+                            "✅ Payment Successful: ₦${data?.amount}\nRRN: ${data?.rrn}",
+                            Toast.LENGTH_LONG
+                        ).show()
 
-                    if (isSuccessful) {
-                        showToast("Transaction Successful")
+                        Log.d(TAG, "========== TRANSACTION SUCCESS ==========")
+                        Log.d(TAG, "Amount: ${data?.amount}")
+                        Log.d(TAG, "RRN: ${data?.rrn}")
+                        Log.d(TAG, "STAN: ${data?.stan}")
+                        Log.d(TAG, "Auth Code: ${data?.authCode}")
+                        Log.d(TAG, "Terminal ID: ${data?.terminalId}")
+                        Log.d(TAG, "Merchant ID: ${data?.merchantId}")
+                        Log.d(TAG, "Card Number: ${data?.cardNumber}")
+                        Log.d(TAG, "Card Holder: ${data?.cardHolderName}")
+                        Log.d(TAG, "Date Time: ${data?.dateTime}")
+                        Log.d(TAG, "Process Code: ${data?.processCode}")
+                        Log.d(TAG, "Process Message: ${data?.processMessage}")
+                        Log.d(TAG, "========================================")
+
+                        notifyAngular("SUCCESS", data)
                     } else {
-                        showToast("Transaction Failed: $message")
+                        // Transaction returned success state but with error code
+                        val errorMessage = when (processCode) {
+                            "01" -> "Card declined by bank"
+                            "05" -> "Transaction declined - Do not honor"
+                            "14" -> "Invalid card number"
+                            "51" -> "Insufficient funds"
+                            "54" -> "Expired card"
+                            "55" -> "Incorrect PIN"
+                            "57" -> "Transaction not permitted to cardholder"
+                            "61" -> "Exceeds withdrawal limit"
+                            "65" -> "Exceeds withdrawal frequency limit"
+                            "91" -> "Issuer unavailable"
+                            else -> processMessage ?: "Transaction failed with code: $processCode"
+                        }
+
+                        Toast.makeText(this, "❌ Payment Failed: $errorMessage", Toast.LENGTH_LONG).show()
+                        Log.d(TAG, "FAILED => State=${response.transactionState}, Code=$processCode, Message=$errorMessage")
+                        notifyAngular("FAILED", data)
                     }
                 }
 
+                TransactionState.TRANSACTION_NOT_SUCCESSFUL -> {
+                    // Transaction was processed but not successful (e.g., declined)
+                    val errorMsg = when {
+                        processCode == "55" -> "Incorrect PIN. Please try again."
+                        processCode == "51" -> "Insufficient funds on card"
+                        processCode == "54" -> "Card has expired"
+                        processCode == "14" -> "Invalid card number"
+                        processCode == "01" -> "Card declined by issuing bank"
+                        else -> processMessage ?: "Transaction declined"
+                    }
+
+                    Toast.makeText(this, "❌ $errorMsg", Toast.LENGTH_LONG).show()
+                    notifyAngular("FAILED", data)
+                }
+
+                TransactionState.FAILED -> {
+                    // Transaction failed due to error
+                    val errorMsg = when {
+                        processCode == "55" -> "Incorrect PIN. Please try again."
+                        processCode == "51" -> "Insufficient funds"
+                        processCode == "91" -> "Bank network error. Please try again."
+                        else -> processMessage ?: "Transaction failed. Please try again."
+                    }
+
+                    Toast.makeText(this, "❌ Transaction Failed: $errorMsg", Toast.LENGTH_LONG).show()
+                    notifyAngular("FAILED", data)
+                }
+
                 else -> {
-                    // Ignore intermediate SDK messages like:
-                    // "Input Pin", "Done", etc.
-                    Log.d(TAG, "Intermediate State: $message")
+                    Log.d(
+                        TAG,
+                        """
+                         =========================
+                            STATE: ${response.transactionState}
+                            DATA: $data
+                            =========================
+                     """.trimIndent()
+                    )
+                    // Show toast for any other states (like DONE_PROCESSING, etc.)
+                    if (response.transactionState.name != "DONE_PROCESSING") {
+                        Toast.makeText(this, "Status: ${response.transactionState}", Toast.LENGTH_SHORT).show()
+                    }
                 }
             }
+        }
+    }
 
-            val jsState = if (isSuccessful) "SUCCESS" else "FAILED"
+    private fun notifyAngular(status: String, data: Any?) {
 
+        val jsonData = Gson().toJson(mapOf(
+            "status" to status,
+            "data" to data
+        ))
+
+        webView.post {
             webView.evaluateJavascript(
                 """
-            if (window.onPosTransaction) {
-                window.onPosTransaction('$jsState');
+            if (window.onPosPaymentResult) {
+                window.onPosPaymentResult($jsonData);
             }
             """.trimIndent(),
                 null
             )
         }
     }
-
     private fun showToast(msg: String) {
         Toast.makeText(this, msg, Toast.LENGTH_LONG).show()
     }
@@ -194,6 +269,8 @@ class MainActivity : FragmentActivity(), RemitaCardTransactionListener {
     // PRINT
     // -----------------------------
     fun printFromWeb(base64Image: String) {
+        Log.d(TAG, "printFromWeb called with Base64 length: ${base64Image.length}")
+        Log.d(TAG, "Base64 preview: ${base64Image.take(100)}")
         lifecycleScope.launch(Dispatchers.IO) {
             try {
                 val cleanBase64 = base64Image
@@ -202,10 +279,16 @@ class MainActivity : FragmentActivity(), RemitaCardTransactionListener {
 
                 val bytes = Base64.decode(cleanBase64, Base64.DEFAULT)
                 val bitmap = BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
+                if (bitmap == null) {
+                    Log.e(TAG, "Bitmap is null - invalid image data")
+                    Log.e(TAG, "First 100 bytes: ${bytes.take(100).joinToString()}")
+                    return@launch
+                }
 
+                Log.d(TAG, "Bitmap created successfully: ${bitmap.width}x${bitmap.height}")
                 withContext(Dispatchers.Main) {
                     remitaK11.print(img = bitmap) {
-                        Log.d(TAG, it)
+                        Log.d(TAG, "Print result: $it")
                     }
                 }
 
